@@ -1,9 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"database/sql"
 	"fmt"
-	"github.com/gocolly/colly"
+	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+
+	"github.com/gocolly/colly"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 var queue []string
@@ -22,7 +30,100 @@ func getDomain(url string) string {
 	}
 }
 
+func setupDatabase() *sql.DB {
+	println("Setting up database...")
+	db, err := sql.Open("sqlite3", "./crawler.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	createTable := `CREATE TABLE IF NOT EXISTS headers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL UNIQUE,
+        header TEXT NOT NULL
+    );`
+
+	_, err = db.Exec(createTable)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	println("Database setup done !")
+	return db
+}
+
+func insertHeader(db *sql.DB, url, header string) {
+	stmt, err := db.Prepare("INSERT INTO headers(url, header) VALUES(?, ?) ON CONFLICT(url) DO NOTHING;")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func(stmt *sql.Stmt) {
+		err = stmt.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}(stmt)
+
+	_, err = stmt.Exec(url, header)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func saveQueue(queue []string) {
+	f, err := os.Create("queue.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func(f *os.File) {
+		err = f.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}(f)
+
+	for _, url := range queue {
+		_, err = f.WriteString(url + "\n")
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
+func retrieveQueue() []string {
+	println("Retrieving queue...")
+
+	f, err := os.Open("queue.txt")
+	if err != nil {
+		println("No queue found, starting from scratch...")
+		return []string{"https://www.lemonde.fr"}
+	}
+	defer func(f *os.File) {
+		err = f.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}(f)
+
+	var retrieved []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		retrieved = append(retrieved, scanner.Text())
+	}
+
+	println("Queue retrieved !")
+	return retrieved
+}
+
 func main() {
+	db := setupDatabase()
+	defer func(db *sql.DB) {
+		err := db.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}(db)
+
 	c = colly.NewCollector(
 		colly.Async(true),
 	)
@@ -38,30 +139,49 @@ func main() {
 		}
 	})
 
-	queue = append(queue, "https://fr.wikipedia.org/")
+	c.OnHTML("h1", func(e *colly.HTMLElement) {
+		header := e.Text
+		url := e.Request.URL.String()
 
-	for len(queue) > 0 {
-		url := queue[0]
-		queue = queue[1:]
-		if cooldown[getDomain(url)] > 0 {
-			continue
-		}
-		fmt.Println("queue length: ", len(queue))
-		fmt.Println("visiting domain: ", getDomain(url))
-		err := c.Visit(url)
-		if err != nil {
-			fmt.Println("Error visiting", url, ":", err)
-		}
+		insertHeader(db, url, header)
+	})
 
-		cooldown[getDomain(url)] = 150
+	queue = retrieveQueue()
 
-		for domain, time := range cooldown {
-			cooldown[domain] = time - 1
-			if time == 0 {
-				delete(cooldown, domain)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		for len(queue) > 0 {
+			url := queue[0]
+			queue = queue[1:]
+			if cooldown[getDomain(url)] > 0 {
+				continue
 			}
-		}
+			fmt.Println("queue length: ", len(queue))
+			fmt.Println("visiting domain: ", getDomain(url))
+			err := c.Visit(url)
+			if err != nil {
+				fmt.Println("Error visiting", url, ":", err)
+			}
 
-		c.Wait()
-	}
+			cooldown[getDomain(url)] = 150
+
+			for domain, time := range cooldown {
+				cooldown[domain] = time - 1
+				if time == 0 {
+					delete(cooldown, domain)
+				}
+			}
+
+			c.Wait()
+		}
+		fmt.Println("Done")
+	}()
+
+	<-sigChan
+	fmt.Println("Interrupting...")
+	saveQueue(queue)
+	fmt.Println("Queue saved")
+	fmt.Println("Exiting...")
 }
