@@ -4,9 +4,15 @@ import (
 	"database/sql"
 	"log"
 	"os"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+type Data struct {
+	url    string
+	header string
+}
 
 func setupDatabase() *sql.DB {
 	db, err := sql.Open("sqlite3", "./crawler.db")
@@ -16,15 +22,21 @@ func setupDatabase() *sql.DB {
 	return db
 }
 
-func search(rows *sql.Rows) []string {
-	var urls []string
+func search(rows *sql.Rows) []Data {
+	var urls []Data
 	for rows.Next() {
 		var url string
-		err := rows.Scan(&url)
+		var header string
+
+		err := rows.Scan(&url, &header)
 		if err != nil {
 			log.Fatal(err)
 		}
-		urls = append(urls, url)
+
+		urls = append(urls, Data{
+			url:    url,
+			header: strings.TrimSpace(header),
+		})
 	}
 	return urls
 }
@@ -39,7 +51,7 @@ func main() {
 	}(db)
 
 	input := os.Args[1]
-	rows, err := db.Query("SELECT url FROM headers WHERE header LIKE ?", "%"+input+"%")
+	rows, err := db.Query("SELECT url, header FROM headers WHERE header LIKE ?", "%"+input+"%")
 	defer func() {
 		err := rows.Close()
 		if err != nil {
@@ -53,6 +65,6 @@ func main() {
 
 	urls := search(rows)
 	for _, url := range urls {
-		println(url)
+		println(url.url + " : " + url.header)
 	}
 }
